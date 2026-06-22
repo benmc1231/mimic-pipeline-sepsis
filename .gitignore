@@ -1,5 +1,6 @@
 # Local MIMIC data
 /data/raw/
+/data/versioned/
 
 /venv/
 
@@ -11,3 +12,6 @@ __pycache__/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Environment variables
+.env
