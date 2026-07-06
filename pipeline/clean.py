@@ -309,14 +309,25 @@ def clean_medications(medications: pd.DataFrame) -> pd.DataFrame:
 def clean_infection_components(infection_components: pd.DataFrame) -> pd.DataFrame:
     """Clean blood culture records from microbiologyevents.
 
-    Where charttime is null but chartdate is populated, imputes charttime as
-    midnight of chartdate. Imputed records are flagged via charttime_imputed.
-    Midnight timestamps are less precise for 6-hour window logic and should
-    be treated with caution in features.py.
+    Adds charttime_imputed flag unconditionally so downstream code in
+    features.py can rely on its presence without checking column existence.
 
-    Data profiling found 14,785 null charttimes (1.8% of blood culture records).
-    All had a valid chartdate, so no records are dropped.
+    Where charttime is null but chartdate is populated, imputes charttime as
+    midnight of chartdate and sets charttime_imputed to True. Midnight
+    timestamps are less precise for 6-hour window logic and should be treated
+    cautiously in features.py.
+
+    Data profiling on raw microbiologyevents found 14,785 null charttimes
+    (1.8% of blood culture records), all with valid chartdates. The cleaned
+    file confirmed 0 null charttimes remaining and all charttime_imputed
+    values False, meaning imputation was not required for this dataset version.
+    The logic is retained as a defensive check since this may differ across
+    MIMIC-IV versions.
     """
+    # Add flag unconditionally so features.py can always reference it
+    infection_components = infection_components.copy()
+    infection_components["charttime_imputed"] = False
+
     null_mask = infection_components["charttime"].isna()
     null_count = null_mask.sum()
 
@@ -324,12 +335,13 @@ def clean_infection_components(infection_components: pd.DataFrame) -> pd.DataFra
         infection_components.loc[null_mask, "charttime"] = pd.to_datetime(
             infection_components.loc[null_mask, "chartdate"]
         )
-        infection_components["charttime_imputed"] = False
         infection_components.loc[null_mask, "charttime_imputed"] = True
         logging.info(
             f"Microbiology: {null_count} charttime values imputed from chartdate "
             f"({null_count / len(infection_components) * 100:.1f}% of records)"
         )
+    else:
+        logging.info("Microbiology: no null charttimes found, no imputation required")
 
     remaining_nulls = infection_components["charttime"].isna().sum()
     if remaining_nulls > 0:
@@ -407,6 +419,12 @@ def clean_vasopressors(vasopressors: pd.DataFrame) -> pd.DataFrame:
         f"nulled due to missing rateuom"
     )
 
+    # Remove negative rates - physiologically impossible
+    neg_mask = vasopressors["rate"] < 0
+    if neg_mask.sum() > 0:
+        logging.info(f"Vasopressors: {neg_mask.sum()} negative rate rows removed")
+        vasopressors = vasopressors[~neg_mask]
+
     null_rates = vasopressors["rate"].isna().sum()
     logging.info(f"Vasopressors: {null_rates} rows with null rate after cleaning")
 
@@ -480,77 +498,95 @@ def _capture_coverage_stats(
 
 def generate_missingness_report(
     cohort: pd.DataFrame,
+    vitals: pd.DataFrame,
+    labs: pd.DataFrame,
     vital_stats: dict,
     lab_stats: dict,
     coverage_stats: dict,
 ) -> pd.DataFrame:
     """Assemble per-feature missingness and coverage report from cleaning outputs.
 
-    Stats are captured inside clean_vitals() and clean_labs() at the point
-    cleaning happens rather than recomputed here.
+    Vitals and labs get per-itemid breakdown. Event tables (vasopressors, urine
+    output, ventilation, medications, infection components) get a single
+    table-level coverage figure.
 
-    Columns:
-        feature: clinical label
-        itemid: MIMIC-IV itemid (null for table-level rows)
-        source: source table name
-        raw_missingness_pct: % of cohort stays/admissions with zero observations
-        post_cleaning_null_pct: % of observations nulled by range filters
-        coverage_pct: % of cohort with at least one row (table-level sources only)
+    All rows include both missingness_pct and coverage_pct as complementary
+    values summing to 100. raw_missingness_pct is clamped to 0 as a minimum
+    to handle the pipeline ordering artefact where event table extracts include
+    rows from LOS-excluded stays. Those stays inflate stays_with_data above
+    the cleaned cohort size, producing a small apparent negative missingness.
+    This is documented in docs/variable_logic.md.
 
-    Output written to data/versioned/missingness_report.csv as a required
-    Phase 1 deliverable. Imputation strategy decisions are documented in
-    docs/variable_logic.md.
+    Required Phase 1 deliverable per the project brief.
+    Output written to data/versioned/missingness_report.csv.
     """
     n_stays = cohort["stay_id"].nunique()
     n_hadms = cohort["hadm_id"].nunique()
+
+    # Restrict to cohort IDs for accurate coverage calculation
+    cohort_stay_ids = set(cohort["stay_id"])
+    cohort_hadm_ids = set(cohort["hadm_id"])
+
     rows = []
 
+    # Vitals: recompute stays_with_data restricted to cohort to avoid
+    # negative missingness from LOS-excluded stays present in extract
     for itemid, s in vital_stats.items():
-        raw = (1 - s["stays_with_data"] / n_stays) * 100 if n_stays else None
+        item_in_cohort = vitals[
+            (vitals["itemid"] == itemid) & (vitals["stay_id"].isin(cohort_stay_ids))
+        ]
+        stays_with_data = item_in_cohort["stay_id"].nunique()
+        raw = max(0.0, (1 - stays_with_data / n_stays) * 100) if n_stays else None
         post = (s["null_obs"] / s["total_obs"]) * 100 if s["total_obs"] else None
+        coverage = round(100 - raw, 2) if raw is not None else None
         rows.append(
             {
                 "feature": VITAL_ITEMID_TO_LABEL.get(itemid, itemid),
                 "itemid": itemid,
                 "source": "vitals",
-                "raw_missingness_pct": round(raw, 2) if raw is not None else None,
+                "missingness_pct": round(raw, 2) if raw is not None else None,
                 "post_cleaning_null_pct": round(post, 2) if post is not None else None,
-                "coverage_pct": None,
+                "coverage_pct": coverage,
             }
         )
 
+    # Labs: same recomputation restricted to cohort hadm_ids
     for itemid, s in lab_stats.items():
-        raw = (1 - s["hadms_with_data"] / n_hadms) * 100 if n_hadms else None
+        item_in_cohort = labs[
+            (labs["itemid"] == itemid) & (labs["hadm_id"].isin(cohort_hadm_ids))
+        ]
+        hadms_with_data = item_in_cohort["hadm_id"].nunique()
+        raw = max(0.0, (1 - hadms_with_data / n_hadms) * 100) if n_hadms else None
         post = (s["null_obs"] / s["total_obs"]) * 100 if s["total_obs"] else None
+        coverage = round(100 - raw, 2) if raw is not None else None
         rows.append(
             {
                 "feature": LAB_ITEMID_TO_LABEL.get(itemid, itemid),
                 "itemid": itemid,
                 "source": "labs",
-                "raw_missingness_pct": round(raw, 2) if raw is not None else None,
+                "missingness_pct": round(raw, 2) if raw is not None else None,
                 "post_cleaning_null_pct": round(post, 2) if post is not None else None,
-                "coverage_pct": None,
+                "coverage_pct": coverage,
             }
         )
 
+    # Event tables: single table-level coverage figure
     for source_name, s in coverage_stats.items():
+        coverage = s["coverage_pct"]
+        missingness = round(100 - coverage, 2) if coverage is not None else None
         rows.append(
             {
                 "feature": source_name,
                 "itemid": None,
                 "source": source_name,
-                "raw_missingness_pct": (
-                    round(100 - s["coverage_pct"], 2)
-                    if s["coverage_pct"] is not None
-                    else None
-                ),
+                "missingness_pct": missingness,
                 "post_cleaning_null_pct": None,
-                "coverage_pct": s["coverage_pct"],
+                "coverage_pct": coverage,
             }
         )
         logging.info(
-            f"{source_name}: {s['covered']}/{s['total_cohort']} cohort units covered "
-            f"({s['coverage_pct']}%)"
+            f"{source_name}: {s['covered']}/{s['total_cohort']} cohort units "
+            f"covered ({coverage}%)"
         )
 
     report = pd.DataFrame(rows)
@@ -604,7 +640,14 @@ def main():
     save_cleaned_extract(ventilation, "ventilation_events_clean.parquet")
     save_cleaned_extract(extracts["diagnosis"], "diagnosis_clean.parquet")
 
-    generate_missingness_report(cohort, vital_stats, lab_stats, coverage_stats)
+    generate_missingness_report(
+        cohort,
+        vitals,
+        labs,
+        vital_stats,
+        lab_stats,
+        coverage_stats,
+    )
 
 
 if __name__ == "__main__":

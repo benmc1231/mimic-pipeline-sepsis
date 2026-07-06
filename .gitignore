@@ -10,6 +10,9 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Test file
+/pipeline/test.py
+
 # Jupyter
 .ipynb_checkpoints/
 
