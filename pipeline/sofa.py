@@ -95,7 +95,10 @@ def compute_sofa_respiratory(vitals_window, ventilation_window):
     result["pf_ratio"] = result["spo2"] / result["fio2"] * 100
 
     # Step 8 - find the index of the minimum ratio per stay
-    min_idx = result.groupby("stay_id")["pf_ratio"].idxmin()
+    # Ventilated stays with no FiO2 ever charted have pf_ratio = NaN for every
+    # row (see step 5/6) - exclude those from idxmin and score them separately.
+    valid = result.dropna(subset=["pf_ratio"])
+    min_idx = valid.groupby("stay_id")["pf_ratio"].idxmin()
 
     # Pull the full row at that index - gives you the charttime and ventilated status at the worst point
     worst = result.loc[min_idx, ["stay_id", "pf_ratio", "ventilated"]].reset_index(
@@ -115,9 +118,33 @@ def compute_sofa_respiratory(vitals_window, ventilation_window):
 
     worst["sofa_respiratory"] = np.select(conditions, scores, default=2)
 
-    return worst[["stay_id", "pf_ratio", "sofa_respiratory"]].rename(
+    worst = worst[["stay_id", "pf_ratio", "sofa_respiratory"]].rename(
         columns={"pf_ratio": "worst_pf_ratio"}
     )
+
+    # Stays with SpO2 recorded but no usable PF ratio (ventilated, FiO2 never
+    # charted): no evidence of respiratory dysfunction available, so default
+    # to a best-case score of 0, consistent with the missing-data convention
+    # used elsewhere in SOFA scoring (e.g. compute_sofa_coagulation).
+    no_ratio_stays = result.loc[
+        ~result["stay_id"].isin(worst["stay_id"]), "stay_id"
+    ].unique()
+    if len(no_ratio_stays):
+        logging.warning(
+            "%d stay(s) had SpO2 but no usable PF ratio (ventilated with no "
+            "FiO2 charted); defaulting sofa_respiratory to 0.",
+            len(no_ratio_stays),
+        )
+        fallback = pd.DataFrame(
+            {
+                "stay_id": no_ratio_stays,
+                "worst_pf_ratio": np.nan,
+                "sofa_respiratory": 0,
+            }
+        )
+        worst = pd.concat([worst, fallback], ignore_index=True)
+
+    return worst
 
 
 def compute_sofa_coagulation(labs_window):

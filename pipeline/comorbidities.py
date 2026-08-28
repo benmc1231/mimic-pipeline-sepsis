@@ -27,10 +27,13 @@ code volume. See docs/variable_logic.md for selection rationale per condition.
 
 import logging
 from pathlib import Path
+from pipeline.comorbidity_scoring import (
+    compute_charlson_score,
+    compute_elixhauser_score,
+)
 
 import pandas as pd
 import polars as pl
-import comorbidipy
 
 from pipeline.constants import (
     CKD_ICD_CODES_FLAT,
@@ -56,80 +59,31 @@ EXTRACT_DIR = Path("data/versioned")
 
 
 def _derive_comorbidity_scores(diagnosis: pd.DataFrame) -> pd.DataFrame:
-    """Derive Charlson and Elixhauser comorbidity scores using comorbidipy.
+    """Derive Charlson and Elixhauser comorbidity scores from ICD-10 codes.
 
-    Processes ICD-9 and ICD-10 codes separately since comorbidipy requires
-    version-specific input. Scores are computed per version then combined by
-    taking the maximum per hadm_id, which correctly handles admissions that
-    have diagnosis codes under both coding systems.
+    Uses manual implementations based on published validated mappings:
+        Charlson: Quan et al. (2005) ICD-10 adaptation
+        Elixhauser: van Walraven et al. (2009) ICD-10 adaptation
+
+    ICD-9 codes are excluded as the mappings cover ICD-10 only. This
+    affects admissions coded entirely under ICD-9 (earlier admissions
+    in MIMIC-IV). Documented in docs/variable_logic.md.
     """
-    if diagnosis.empty:
-        return pd.DataFrame(columns=["hadm_id", "charlson_score", "elixhauser_score"])
+    charlson = compute_charlson_score(diagnosis)
+    elixhauser = compute_elixhauser_score(diagnosis)
 
-    diagnosis = diagnosis.copy()
-    diagnosis["icd_code"] = diagnosis["icd_code"].astype(str).str.strip()
-    diagnosis["icd_version"] = diagnosis["icd_version"].astype(str).str.strip()
+    result = diagnosis[["hadm_id"]].drop_duplicates()
+    result = result.merge(charlson, on="hadm_id", how="left")
+    result = result.merge(elixhauser, on="hadm_id", how="left")
+    result["charlson_score"] = result["charlson_score"].fillna(0).astype(int)
+    result["elixhauser_score"] = result["elixhauser_score"].fillna(0).astype(int)
 
-    version_map = {
-        "9": "icd9",
-        "10": "icd10",
-        "icd9": "icd9",
-        "icd10": "icd10",
-        "ICD9": "icd9",
-        "ICD10": "icd10",
-    }
-    diagnosis["icd_version_key"] = (
-        diagnosis["icd_version"].map(version_map).fillna("icd10")
+    logging.info(
+        f"Comorbidity scores: mean Charlson {result['charlson_score'].mean():.2f}, "
+        f"mean Elixhauser {result['elixhauser_score'].mean():.2f}"
     )
 
-    score_frames = {}
-    for score_name in ("charlson", "elixhauser"):
-        score_chunks = []
-        for version in ("icd9", "icd10"):
-            subset = diagnosis.loc[
-                diagnosis["icd_version_key"] == version,
-                ["hadm_id", "icd_code"],
-            ]
-            if subset.empty:
-                continue
-
-            polars_df = pl.DataFrame(
-                {
-                    "hadm_id": subset["hadm_id"].astype("Int64"),
-                    "code": subset["icd_code"],
-                }
-            )
-            score_df = comorbidipy.comorbidity(
-                polars_df,
-                id_col="hadm_id",
-                code_col="code",
-                score=comorbidipy.ScoreType(score_name),
-                icd=comorbidipy.ICDVersion(version),
-            ).to_pandas()
-            score_df = score_df.rename(
-                columns={"comorbidity_score": f"{score_name}_score"}
-            )
-            score_chunks.append(score_df[["hadm_id", f"{score_name}_score"]])
-
-        if score_chunks:
-            combined = pd.concat(score_chunks, ignore_index=True)
-            combined = combined.groupby("hadm_id", as_index=False).max()
-        else:
-            combined = pd.DataFrame(
-                {
-                    "hadm_id": diagnosis["hadm_id"].drop_duplicates(),
-                    f"{score_name}_score": 0,
-                }
-            )
-
-        score_frames[score_name] = combined
-
-    output = diagnosis[["hadm_id"]].drop_duplicates().reset_index(drop=True)
-    output = output.merge(score_frames["charlson"], on="hadm_id", how="left")
-    output = output.merge(score_frames["elixhauser"], on="hadm_id", how="left")
-    output["charlson_score"] = output["charlson_score"].fillna(0).astype(int)
-    output["elixhauser_score"] = output["elixhauser_score"].fillna(0).astype(int)
-    return output
+    return result
 
 
 # ---------------------------------------------------------------------------

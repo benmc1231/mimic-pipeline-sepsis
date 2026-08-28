@@ -12,6 +12,7 @@ __pycache__/
 
 # Test file
 /pipeline/test.py
+/pipeline/validate_pipeline.py
 
 # Jupyter
 .ipynb_checkpoints/
